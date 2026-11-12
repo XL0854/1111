@@ -127,7 +127,7 @@ def geometry_metrics(grid, valid, source_size):
                 if interior.any() else None)
 
 
-def measure(result, source_size):
+def measure(result, source_size, fusion=None):
     images, support, grid, details = result
     if not all(torch.isfinite(tensor).all() for tensor in (images, support, grid)):
         raise InvalidPair("Non-finite renderer output")
@@ -136,6 +136,9 @@ def measure(result, source_size):
     union = valid.any(0)
     if not union.any():
         raise InvalidPair("No valid output pixels")
+    fused_tensor = None
+    if fusion is not None:
+        fused_tensor = fusion(images, support)[0][0].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
     image = (images * valid[:, None]).permute(0, 2, 3, 1).clamp(0, 1).cpu().numpy()
     mask = overlap.cpu().numpy()
     # Use the same 7x7 SSIM and support rule for both arms.
@@ -150,7 +153,8 @@ def measure(result, source_size):
     if mask.any():
         mse = np.square(image[0][mask] - image[1][mask]).mean()
         psnr = float(-10*np.log10(max(float(mse), 1e-12)))
-    fused = image.sum(0) / valid.sum(0).clamp_min(1).cpu().numpy()[..., None]
+    fused = (fused_tensor if fused_tensor is not None else
+             image.sum(0) / valid.sum(0).clamp_min(1).cpu().numpy()[..., None])
     metrics = dict(mpsnr_db=psnr, mssim=score, valid_canvas=float(union.float().mean()),
                    overlap_canvas=float(overlap.float().mean()),
                    overlap_pixels=int(overlap.sum()), canvas=list(overlap.shape), **details)
@@ -186,8 +190,8 @@ def main(args):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
     state = read_checkpoint(args.checkpoint)
-    if state["epoch"] != 150 or state["config"]["model"]["plane_mode"] != "fixed-half":
-        raise ValueError("Expected the final 150-epoch fixed-half checkpoint")
+    if state["config"]["model"]["plane_mode"] != "fixed-half":
+        raise ValueError("Expected a fixed-half checkpoint")
     for key in MODEL_KEYS:
         setattr(args, key, state["config"]["model"][key])
     pairs = discover(args.data)
@@ -224,11 +228,12 @@ def main(args):
         row = dict(id=name, train_overlap=sum(digest in training for digest in hashes[1:]))
         try:
             images = load_pair(pair)
-            renderers = (lambda: original.render(images, model), lambda: refined(images, model))
-            for arm, renderer in zip(ARMS, renderers):
+            renderers = ((lambda: original.render(images, model), None),
+                         (lambda: refined(images, model), model.fuse))
+            for arm, (renderer, fusion) in zip(ARMS, renderers):
                 tick = time.perf_counter()
                 try:
-                    row[arm], fused = measure(renderer(), images.shape[-2:])
+                    row[arm], fused = measure(renderer(), images.shape[-2:], fusion)
                     row[arm]["evaluation_seconds"] = time.perf_counter() - tick
                     image_file(args.out / arm / f"{name}.jpg", fused)
                 except (InvalidPair, torch.linalg.LinAlgError, cv2.error) as exc:

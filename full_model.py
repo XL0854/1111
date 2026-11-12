@@ -9,11 +9,18 @@ from torch import nn
 import torch.nn.functional as F
 
 from model import (InvalidPair, PixelResidual, fixed_overlap, load_weights, mesh_canvas,
-                   objective, photo, pixel_grid, grid_with_offset, render, warp)
+                   objective, photo, pixel_grid, grid_with_offset, refine, render, warp)
+from paper_modules import (DifferenceAwareSeamFusion, MultiScaleDualAttention,
+                           attach_correlation_adapter, frequency_flow_objective,
+                           frequency_photo, seam_objective)
 
 
-PHASES = ("geometry", "plane", "residual", "joint")
-FLOW_WEIGHTS = dict(cycle=0.01, smooth=0.015, nonoverlap=0.04, coverage=0.5, fold=0.15)
+PHASES = ("geometry", "plane", "residual", "fusion", "joint")
+FLOW_WEIGHTS = dict(
+    baseline=dict(cycle=0.01, smooth=0.015, nonoverlap=0.04, coverage=0.5, fold=0.15),
+    freq_low=0.15,
+    freq_high=0.05,
+)
 
 
 class Midpoint(nn.Module):
@@ -41,10 +48,18 @@ class FullModel(nn.Module):
         from semantic_refine import inverse_tps, plane_grid
 
         self.geometry = Network(pretrained=False)
+        self.alignment_adapter = (
+            MultiScaleDualAttention() if args.alignment_adapter == "msda" else None
+        )
+        if self.alignment_adapter is not None:
+            attach_correlation_adapter(self.geometry, self.alignment_adapter)
         self.fixed_plane = args.plane_mode == "fixed-half"
         self.coef = None if self.fixed_plane else CoefNetwork()
         self.flow = PixelResidual(args.pixel, args.pixel_weights if init == "pretrained" else None,
                                   args.max_shift, args.iters)
+        self.fusion = (
+            DifferenceAwareSeamFusion(args.fusion_width) if args.fusion_mode == "seam" else None
+        )
         self.rigid_mesh = get_rigid_mesh
         self.dlt, self.h2mesh = Tensor_ACA_rect, H2Mesh
         self.inverse_tps, self.plane_grid = inverse_tps, plane_grid
@@ -65,10 +80,21 @@ class FullModel(nn.Module):
     def set_phase(self, phase):
         self.eval()
         self.geometry.requires_grad_(phase in ("geometry", "joint"))
+        if self.alignment_adapter is not None:
+            self.alignment_adapter.requires_grad_(phase in ("geometry", "joint"))
         if self.coef is not None:
             self.coef.requires_grad_(phase in ("plane", "joint"))
         self.flow.requires_grad_(phase in ("residual", "joint"))
         self.flow.raft.image_match.requires_grad_(False)
+        if self.fusion is not None:
+            self.fusion.requires_grad_(phase in ("fusion", "joint"))
+
+    def fuse(self, images, support):
+        if self.fusion is not None:
+            return self.fusion(images, support)
+        weights = support / support.sum(0, keepdim=True).clamp_min(1e-6)
+        fused = (images * weights).sum(0, keepdim=True)
+        return fused, None, weights
 
     def build(self, images, phase):
         train_geometry = phase in ("geometry", "plane", "joint")
@@ -153,12 +179,23 @@ def training_objective(model, images, phase, synthetic_target):
     if int(fixed.sum()) < 64:
         raise InvalidPair("Fewer than 64 fixed overlap pixels")
     if phase == "residual":
-        return objective(canvas, *model.flow(canvas), FLOW_WEIGHTS)
+        return frequency_flow_objective(canvas, *model.flow(canvas), objective, FLOW_WEIGHTS)
+    if phase == "fusion":
+        if model.fusion is None:
+            raise ValueError("The fusion phase requires --fusion-mode seam")
+        with torch.no_grad():
+            residual, _, base = model.flow(canvas)
+            refined, support = refine(canvas, base, residual)
+        fused, probability, _ = model.fuse(refined, support)
+        return seam_objective(refined, support, fused, probability)
 
     terms = dict(tps_photo=photo(canvas.images, fixed),
                  tps_shape=local_mesh_penalty(meshes),
                  plane_shape=local_mesh_penalty(plane_mesh))
     total = terms["tps_photo"] + 0.045 * terms["tps_shape"] + 0.025 * terms["plane_shape"]
+    terms["freq_low"], terms["freq_high"] = frequency_photo(canvas.images, fixed)
+    total = total + FLOW_WEIGHTS["freq_low"] * terms["freq_low"] \
+        + FLOW_WEIGHTS["freq_high"] * terms["freq_high"]
     if phase in ("geometry", "joint"):
         terms["global_photo"] = global_photo(images, h)
         total = total + 0.5 * terms["global_photo"]
@@ -167,7 +204,16 @@ def training_objective(model, images, phase, synthetic_target):
                                               synthetic_target.expand_as(motion) / 32)
         total = total + 0.5 * terms["synthetic_h"]
     if phase == "joint":
-        flow_loss, flow_terms = objective(canvas, *model.flow(canvas), FLOW_WEIGHTS)
+        residual, cycle, base = model.flow(canvas)
+        flow_loss, flow_terms = frequency_flow_objective(
+            canvas, residual, cycle, base, objective, FLOW_WEIGHTS
+        )
         terms.update({f"flow_{k}": v for k, v in flow_terms.items()})
         total = total + flow_loss
+        if model.fusion is not None:
+            refined, support = refine(canvas, base, residual)
+            fused, probability, _ = model.fuse(refined, support)
+            seam_loss, seam_terms = seam_objective(refined, support, fused, probability)
+            terms.update(seam_terms)
+            total = total + seam_loss
     return total, terms

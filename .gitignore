@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+experiments/
+runs/
+checkpoints/
+vendor/pixelstitch/checkpoints/
+vendor/ropstitch/torch_cache/
+vendor/ropstitch/wCoefNet/Codes/nohup_*.out
+vendor/ropstitch/wCoefNet/model_coef/
+vendor/ropstitch/woCoefNet/

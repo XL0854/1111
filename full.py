@@ -17,11 +17,14 @@ from run import (discover, disjoint_train_val, file_hash, image_file, inference_
                  load_pair, log_line)
 
 
-FORMAT = "ropstitch-pixel-full-v1"
-MODEL_KEYS = ("max_edge", "max_shift", "iters", "homo_bound", "tps_bound", "plane_mode")
+FORMAT = "ropstitch-pixel-full-v2"
+LEGACY_FORMAT = "ropstitch-pixel-full-v1"
+MODEL_KEYS = ("max_edge", "max_shift", "iters", "homo_bound", "tps_bound", "plane_mode",
+              "alignment_adapter", "fusion_mode", "fusion_width")
 DEFAULTS = dict(max_edge=512, max_shift=16.0, iters=4, homo_bound=160.0, tps_bound=96.0,
-                plane_mode="learned")
-PHASE_LR = dict(geometry=1e-4, plane=1e-4, residual=1e-5, joint=3e-6)
+                plane_mode="learned", alignment_adapter="msda", fusion_mode="seam",
+                fusion_width=24)
+PHASE_LR = dict(geometry=1e-4, plane=1e-4, residual=1e-5, fusion=1e-4, joint=3e-6)
 
 
 def schedule(value):
@@ -52,9 +55,13 @@ def save(path, state):
 
 def read_checkpoint(path):
     state = torch.load(path, map_location="cpu", weights_only=True)
-    if state.get("format") != FORMAT:
+    if state.get("format") not in (FORMAT, LEGACY_FORMAT):
         raise ValueError("Expected a full-pipeline checkpoint created by full.py")
     state["config"]["model"].setdefault("plane_mode", "learned")
+    if state["format"] == LEGACY_FORMAT:
+        state["config"]["model"].setdefault("alignment_adapter", "none")
+        state["config"]["model"].setdefault("fusion_mode", "mean")
+        state["config"]["model"].setdefault("fusion_width", 24)
     return state
 
 
@@ -66,7 +73,7 @@ def phase_optimizer(model, phase, multiplier):
 
 def gradient_groups(model):
     result = {}
-    for name in ("geometry", "coef", "flow"):
+    for name in ("geometry", "alignment_adapter", "coef", "flow", "fusion"):
         module = getattr(model, name)
         grads = [p.grad.detach().norm().square() for p in (() if module is None else module.parameters())
                  if p.grad is not None]
@@ -74,14 +81,17 @@ def gradient_groups(model):
     return result
 
 
-def train(args, previous):
+def train(args, previous, base_state=None):
     pairs = discover(args.data, args.list)
     validation = discover(args.val_data, args.val_list) if args.val_data else []
     if validation:
         disjoint_train_val(pairs, validation)
     model_cfg = {key: getattr(args, key) for key in MODEL_KEYS}
+    base_hash = (previous["config"].get("base_checkpoint_sha256") if previous else
+                 file_hash(args.base_checkpoint) if args.base_checkpoint else None)
     configuration = dict(model=model_cfg, seed=args.seed, lr_multiplier=args.lr_multiplier,
-                         train=pair_fingerprint(pairs), val=pair_fingerprint(validation))
+                         train=pair_fingerprint(pairs), val=pair_fingerprint(validation),
+                         base_checkpoint_sha256=base_hash)
     start, best = 0, None
     if previous:
         if configuration != previous["config"]:
@@ -92,14 +102,20 @@ def train(args, previous):
         best = previous["best"]
     if len(args.schedule) <= start:
         raise ValueError("Training schedule has no epochs after the checkpoint")
-    init = previous["init"] if previous else args.init
+    init = previous["init"] if previous else ("base" if base_state is not None else args.init)
     if init == "scratch" and not previous and args.schedule[0] != "geometry":
         raise ValueError("Scratch training must start with the geometry phase")
-    model = FullModel(args, "checkpoint" if previous else init).cuda()
+    model = FullModel(args, "checkpoint" if previous or base_state is not None else init).cuda()
     if previous:
         model.load_state_dict(previous["model"])
         torch.set_rng_state(previous["torch_rng"])
         torch.cuda.set_rng_state(previous["cuda_rng"])
+    elif base_state is not None:
+        incompatible = model.load_state_dict(base_state["model"], strict=False)
+        allowed = ("alignment_adapter.", "fusion.")
+        if incompatible.unexpected_keys or any(
+                not key.startswith(allowed) for key in incompatible.missing_keys):
+            raise ValueError(f"Incompatible base checkpoint: {incompatible}")
     init_keys = ("alignment", "pixel_weights") if args.plane_mode == "fixed-half" else (
         "alignment", "coefficient", "pixel_weights"
     )
@@ -153,7 +169,7 @@ def train(args, previous):
             raise ValueError(f"No valid training pairs in epoch {epoch} ({phase})")
 
         val_values = []
-        if validation and phase in ("residual", "joint"):
+        if validation and phase in ("residual", "fusion", "joint"):
             for pair in validation:
                 try:
                     _, _, row = inference_metrics(
@@ -184,6 +200,7 @@ def train(args, previous):
         print(json.dumps(row), flush=True)
 
 
+@torch.no_grad()
 def test(args, state):
     model = FullModel(args, "checkpoint").cuda().eval()
     model.load_state_dict(state["model"])
@@ -204,8 +221,11 @@ def test(args, state):
                 path.mkdir()
                 warps = (images * masks).permute(0, 2, 3, 1).cpu().numpy()
                 mask = masks[:, 0].cpu().numpy()
-                blend = warps.sum(0) / np.maximum(mask.sum(0)[..., None], 1)
-                image_file(path / "blend.png", blend)
+                fused, probability, _ = model.fuse(images, masks.float())
+                image_file(path / "blend.png", fused[0].permute(1, 2, 0).cpu().numpy())
+                if probability is not None:
+                    image_file(path / "seam_probability.png",
+                               probability[0, 0].cpu().numpy())
                 for view in (0, 1):
                     image_file(path / f"warp{view+1}.png", warps[view])
                     image_file(path / f"mask{view+1}.png", mask[view])
@@ -234,16 +254,19 @@ def main():
             p.add_argument(f"--{flag}", type=Path, required=True)
         p.add_argument("--list", type=Path)
         p.add_argument("--gpu", type=int, choices=(0, 1), default=1)
-        for key in MODEL_KEYS[:-1]:
+        for key in ("max_edge", "max_shift", "iters", "homo_bound", "tps_bound", "fusion_width"):
             p.add_argument("--"+key.replace("_", "-"), type=type(DEFAULTS[key]))
         p.add_argument("--plane-mode", choices=("learned", "fixed-half"))
+        p.add_argument("--alignment-adapter", choices=("none", "msda"))
+        p.add_argument("--fusion-mode", choices=("mean", "seam"))
         p.add_argument("--min-retention", type=float, default=0.995)
         if name == "train":
             p.add_argument("--init", choices=("scratch", "pretrained"), default="scratch")
             p.add_argument("--schedule", type=schedule)
             p.add_argument("--seed", type=int, default=2026)
             p.add_argument("--lr-multiplier", type=float, default=1.0)
-            for key in ("alignment", "coefficient", "pixel_weights", "resume", "val_data", "val_list"):
+            for key in ("alignment", "coefficient", "pixel_weights", "resume", "base_checkpoint",
+                        "val_data", "val_list"):
                 p.add_argument("--"+key.replace("_", "-"), type=Path)
         else:
             p.add_argument("--checkpoint", type=Path, required=True)
@@ -259,12 +282,16 @@ def main():
             parser.error("--val-list requires --val-data")
         if not math.isfinite(args.lr_multiplier) or args.lr_multiplier <= 0:
             parser.error("Invalid learning-rate multiplier")
+        if args.resume and args.base_checkpoint:
+            parser.error("Use either --resume or --base-checkpoint, not both")
         previous = read_checkpoint(args.resume) if args.resume else None
+        base_state = read_checkpoint(args.base_checkpoint) if args.base_checkpoint else None
         args.alignment = args.alignment or args.rop / "woCoefNet/model_homo/epoch100_model.pth"
         args.coefficient = args.coefficient or args.rop / "wCoefNet/model_coef/epoch050_coefmodel.pth"
         args.pixel_weights = args.pixel_weights or args.pixel / "checkpoints/ckpt.pth"
     else:
         previous = read_checkpoint(args.checkpoint)
+        base_state = None
     for key in MODEL_KEYS:
         if getattr(args, key) is None:
             setattr(args, key, previous["config"]["model"][key] if previous else DEFAULTS[key])
@@ -272,13 +299,20 @@ def main():
         parser.error("The plane mode must match the checkpoint")
     if args.command == "train":
         if args.schedule is None:
-            args.schedule = schedule("geometry:100,residual:50" if args.plane_mode == "fixed-half"
-                                     else "geometry:10,plane:5,residual:5,joint:5")
+            if args.base_checkpoint:
+                args.schedule = schedule("geometry:10,residual:10,fusion:20")
+            else:
+                args.schedule = schedule("geometry:100,residual:50,fusion:20"
+                                         if args.plane_mode == "fixed-half"
+                                         else "geometry:10,plane:5,residual:5,fusion:5,joint:5")
         if args.plane_mode == "fixed-half" and "plane" in args.schedule:
             parser.error("Fixed-half mode has no learnable plane phase")
+        if "fusion" in args.schedule and args.fusion_mode != "seam":
+            parser.error("The fusion phase requires --fusion-mode seam")
     if not (64 <= args.max_edge <= 1200 and 0 < args.max_shift <= 64 and 1 <= args.iters <= 12
             and 0 < args.homo_bound <= 224 and 0 < args.tps_bound <= 160
-            and 0 < args.min_retention <= 1):
+            and 0 < args.min_retention <= 1 and 8 <= args.fusion_width <= 64
+            and args.fusion_width % 4 == 0):
         parser.error("Invalid model bounds or retention")
     if not torch.cuda.is_available():
         raise RuntimeError(f"CUDA unavailable on requested GPU{args.gpu}")
@@ -287,7 +321,7 @@ def main():
     torch.set_num_threads(1)
     cv2.setNumThreads(1)
     if args.command == "train":
-        train(args, previous)
+        train(args, previous, base_state)
     else:
         test(args, previous)
 

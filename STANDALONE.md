@@ -6,7 +6,7 @@
 
 ```bash
 conda activate ropstitch
-cd /workspace/python_pro/test1/sxl/FixedHalfPixelPipeline
+cd /workspace/python_pro/test1/sxl/Rop05Pixe
 
 python ResearchRuntime/launch.py --gpu 1 --name scratch_v1 --program stitch.py -- \
   train --data /path/to/training --out runs/scratch_v1 --gpu 1
@@ -16,9 +16,19 @@ python ResearchRuntime/launch.py --gpu 1 --name test_v1 --program stitch.py -- \
   --out runs/test_v1 --gpu 1
 ```
 
-默认训练从随机权重开始，先跑 100 轮几何，再跑 50 轮残差。用 `--schedule geometry:60,residual:20` 可以调整轮数。每轮保存 `last.pt`，可在新输出目录用 `--resume` 续训。
+论文适配的新增代码全部集中在 `paper_modules.py`：多尺度双注意相关适配器、频率结构/边缘损失，以及差异感知缝合掩码与对应损失。原基线仅保留调用钩子。默认从随机权重训练 100 轮几何、50 轮残差和 20 轮融合；可用 `--schedule geometry:60,residual:20,fusion:10` 调整。每轮保存 `last.pt`，可在新输出目录用 `--resume` 续训。
 
-普通测试输出拼接图、两张变形图、有效掩码和光度指标。此前得到 mPSNR 25.128 dB、mSSIM 0.7930 的检查点已放在 `checkpoints/fixed_half_pixel_epoch150.pt`。要复算上述指标，使用原先的 1,105 对清单及同一比较入口：
+要从已有 150 轮固定半移＋PixelStitch 权重继续训练新增模块，而不重跑全部基线：
+
+```bash
+python ResearchRuntime/launch.py --gpu 1 --name paper_adapter_v1 --program stitch.py -- \
+  train --data /path/to/training \
+  --base-checkpoint checkpoints/fixed_half_pixel_epoch150.pt \
+  --schedule geometry:10,residual:10,fusion:20 \
+  --out runs/paper_adapter_v1 --gpu 1
+```
+
+普通测试输出学习缝合后的 `blend.png`、`seam_probability.png`、两张变形图、有效掩码和光度指标。此前得到 mPSNR 25.128 dB、mSSIM 0.7930 的基线检查点仍保留在 `checkpoints/fixed_half_pixel_epoch150.pt`。论文模块是否提升指标必须在同一 1,105 对上实测，代码不预设“必然提升”。使用同一比较入口：
 
 ```bash
 python ResearchRuntime/launch.py --gpu 1 --name reproduce_v1 --program stitch.py -- \
