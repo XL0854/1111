@@ -8,6 +8,7 @@ import sys
 
 def main():
     root = Path(__file__).resolve().parent
+    codes = root / "codes"
     if len(sys.argv) < 2 or sys.argv[1] not in ("train", "test", "compare"):
         raise SystemExit("Usage: python stitch.py {train,test,compare} --help")
     command, *options = sys.argv[1:]
@@ -17,11 +18,12 @@ def main():
                 "--pixel", str(root / "vendor/pixelstitch")]
     if command == "compare":
         os.environ.setdefault("TORCH_HOME", str(root / "vendor/ropstitch/torch_cache"))
-        entry = root / "compare_full_test.py"
+        entry = codes / "compare_full_test.py"
     else:
-        entry = root / "full.py"
+        entry = codes / "full.py"
         options = [command, "--plane-mode", "fixed-half", *options]
     sys.argv = [str(entry), *options]
+    sys.path.insert(0, str(codes))
     runpy.run_path(str(entry), run_name="__main__")
 
 
