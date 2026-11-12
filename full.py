@@ -1,0 +1,296 @@
+"""Staged training, joint fine-tuning and testing from paired original images."""
+
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import random
+
+import cv2
+import numpy as np
+import torch
+
+from full_model import FullModel, PHASES, synthetic_pair, training_objective
+from model import InvalidPair
+from run import (discover, disjoint_train_val, file_hash, image_file, inference_metrics,
+                 load_pair, log_line)
+
+
+FORMAT = "ropstitch-pixel-full-v1"
+MODEL_KEYS = ("max_edge", "max_shift", "iters", "homo_bound", "tps_bound", "plane_mode")
+DEFAULTS = dict(max_edge=512, max_shift=16.0, iters=4, homo_bound=160.0, tps_bound=96.0,
+                plane_mode="learned")
+PHASE_LR = dict(geometry=1e-4, plane=1e-4, residual=1e-5, joint=3e-6)
+
+
+def schedule(value):
+    try:
+        stages = [(name, int(count)) for name, count in (x.split(":") for x in value.split(","))]
+        indices = [PHASES.index(name) for name, _ in stages]
+        if sorted(set(indices)) != indices or any(count < 1 for _, count in stages):
+            raise ValueError
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Use ordered positive phase counts: geometry:10,plane:5,residual:5,joint:5"
+        ) from exc
+    return [name for name, count in stages for _ in range(count)]
+
+
+def pair_fingerprint(pairs):
+    digest = []
+    for name, a, b in pairs:
+        digest.append([name, file_hash(a), file_hash(b)])
+    return digest
+
+
+def save(path, state):
+    tmp = path.with_suffix(".tmp")
+    torch.save(state, tmp)
+    tmp.replace(path)
+
+
+def read_checkpoint(path):
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if state.get("format") != FORMAT:
+        raise ValueError("Expected a full-pipeline checkpoint created by full.py")
+    state["config"]["model"].setdefault("plane_mode", "learned")
+    return state
+
+
+def phase_optimizer(model, phase, multiplier):
+    model.set_phase(phase)
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    return torch.optim.AdamW(parameters, lr=PHASE_LR[phase]*multiplier, weight_decay=1e-4), parameters
+
+
+def gradient_groups(model):
+    result = {}
+    for name in ("geometry", "coef", "flow"):
+        module = getattr(model, name)
+        grads = [p.grad.detach().norm().square() for p in (() if module is None else module.parameters())
+                 if p.grad is not None]
+        result[name] = float(torch.stack(grads).sum().sqrt()) if grads else 0.0
+    return result
+
+
+def train(args, previous):
+    pairs = discover(args.data, args.list)
+    validation = discover(args.val_data, args.val_list) if args.val_data else []
+    if validation:
+        disjoint_train_val(pairs, validation)
+    model_cfg = {key: getattr(args, key) for key in MODEL_KEYS}
+    configuration = dict(model=model_cfg, seed=args.seed, lr_multiplier=args.lr_multiplier,
+                         train=pair_fingerprint(pairs), val=pair_fingerprint(validation))
+    start, best = 0, None
+    if previous:
+        if configuration != previous["config"]:
+            raise ValueError("Resume needs identical dataset, model options, seed and LR multiplier")
+        start = previous["epoch"]
+        if args.schedule[:start] != previous["schedule"][:start]:
+            raise ValueError("Completed schedule prefix differs from the checkpoint")
+        best = previous["best"]
+    if len(args.schedule) <= start:
+        raise ValueError("Training schedule has no epochs after the checkpoint")
+    init = previous["init"] if previous else args.init
+    if init == "scratch" and not previous and args.schedule[0] != "geometry":
+        raise ValueError("Scratch training must start with the geometry phase")
+    model = FullModel(args, "checkpoint" if previous else init).cuda()
+    if previous:
+        model.load_state_dict(previous["model"])
+        torch.set_rng_state(previous["torch_rng"])
+        torch.cuda.set_rng_state(previous["cuda_rng"])
+    init_keys = ("alignment", "pixel_weights") if args.plane_mode == "fixed-half" else (
+        "alignment", "coefficient", "pixel_weights"
+    )
+    init_hashes = previous["init_hashes"] if previous else (
+        {k: file_hash(getattr(args, k)) for k in init_keys}
+        if init == "pretrained" else {}
+    )
+    args.out.mkdir(parents=True)
+    log_line(args.out / "plan.jsonl", dict(config=configuration, schedule=args.schedule,
+             init=init, init_hashes=init_hashes, train_pairs=len(pairs), validation_pairs=len(validation)))
+    old_phase = None
+    for offset in range(start, len(args.schedule)):
+        epoch, phase = offset + 1, args.schedule[offset]
+        if old_phase != phase:
+            model.zero_grad(set_to_none=True)
+            optimizer, parameters = phase_optimizer(model, phase, args.lr_multiplier)
+            if previous and offset == start and phase == previous["phase"]:
+                optimizer.load_state_dict(previous["optimizer"])
+            old_phase = phase
+        order = list(pairs)
+        random.Random(args.seed + epoch).shuffle(order)
+        values = []
+        for index, pair in enumerate(order, 1):
+            optimizer.zero_grad(set_to_none=True)
+            target = None
+            try:
+                images = load_pair(pair)
+                if phase == "geometry" and init == "scratch" and (index + epoch) % 2 == 0:
+                    images, target = synthetic_pair(images, args.seed + epoch*100_003 + index)
+                loss, terms = training_objective(model, images, phase, target)
+            except (InvalidPair, torch.linalg.LinAlgError) as exc:
+                log_line(args.out / "skipped.jsonl", dict(epoch=epoch, phase=phase, id=pair[0], reason=str(exc)))
+                continue
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite loss during {phase}: {pair[0]}")
+            loss.backward()
+            groups = gradient_groups(model) if not values else None
+            norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+            optimizer.step()
+            result = dict(epoch=epoch, phase=phase, id=pair[0], step=index, loss=float(loss.detach()),
+                          synthetic=target is not None, grad_norm=float(norm))
+            if groups is not None:
+                result["gradient_groups"] = groups
+            result.update({key: float(value.detach()) for key, value in terms.items()})
+            values.append(result["loss"])
+            log_line(args.out / "steps.jsonl", result)
+            if index == 1 or index % 25 == 0 or index == len(order):
+                print(f"{phase} epoch={epoch} pair={index}/{len(order)} loss={result['loss']:.6f} "
+                      f"grad={float(norm):.6f} groups={groups}", flush=True)
+        if not values:
+            raise ValueError(f"No valid training pairs in epoch {epoch} ({phase})")
+
+        val_values = []
+        if validation and phase in ("residual", "joint"):
+            for pair in validation:
+                try:
+                    _, _, row = inference_metrics(
+                        pair, lambda images: model.build(images, "test")[0],
+                        model.flow, args.min_retention, False,
+                    )
+                    if row["refined_photo"] is not None:
+                        val_values.append(row["refined_photo"])
+                except InvalidPair as exc:
+                    row = dict(id=pair[0], error=str(exc))
+                log_line(args.out / "validation.jsonl", dict(epoch=epoch, **row))
+            if not val_values:
+                raise ValueError("No usable validation pairs")
+        score = float(np.mean(val_values)) if val_values else None
+        improved = score is not None and (best is None or score < best)
+        if improved:
+            best = score
+        state = dict(format=FORMAT, model=model.state_dict(), config=configuration, epoch=epoch,
+                     phase=phase, schedule=args.schedule, best=best, init=init, init_hashes=init_hashes,
+                     optimizer=optimizer.state_dict(), torch_rng=torch.get_rng_state(),
+                     cuda_rng=torch.cuda.get_rng_state())
+        save(args.out / "last.pt", state)
+        if improved:
+            save(args.out / "best.pt", state)
+        row = dict(epoch=epoch, phase=phase, used=len(values), skipped=len(order)-len(values),
+                   train_loss=float(np.mean(values)), validation_photo=score)
+        log_line(args.out / "epochs.jsonl", row)
+        print(json.dumps(row), flush=True)
+
+
+def test(args, state):
+    model = FullModel(args, "checkpoint").cuda().eval()
+    model.load_state_dict(state["model"])
+    pairs = discover(args.data, args.list)
+    args.out.mkdir(parents=True)
+    log_line(args.out / "plan.jsonl", dict(checkpoint=str(args.checkpoint),
+             checkpoint_sha256=file_hash(args.checkpoint), guard=not args.no_guard,
+             options={key: getattr(args, key) for key in MODEL_KEYS}))
+    passed = []
+    for i, pair in enumerate(pairs, 1):
+        try:
+            images, masks, row = inference_metrics(
+                pair, lambda im: model.build(im, "test")[0], model.flow,
+                args.min_retention, not args.no_guard,
+            )
+            if not args.metrics_only:
+                path = args.out / pair[0]
+                path.mkdir()
+                warps = (images * masks).permute(0, 2, 3, 1).cpu().numpy()
+                mask = masks[:, 0].cpu().numpy()
+                blend = warps.sum(0) / np.maximum(mask.sum(0)[..., None], 1)
+                image_file(path / "blend.png", blend)
+                for view in (0, 1):
+                    image_file(path / f"warp{view+1}.png", warps[view])
+                    image_file(path / f"mask{view+1}.png", mask[view])
+            passed.append(row)
+        except (InvalidPair, torch.linalg.LinAlgError) as exc:
+            row = dict(id=pair[0], error=str(exc))
+        log_line(args.out / "pairs.jsonl", row)
+        if i == 1 or i % 25 == 0 or i == len(pairs):
+            print(f"Tested {i}/{len(pairs)}; valid {len(passed)}", flush=True)
+    changes = [r["refined_photo"]-r["baseline_photo"] for r in passed if r["baseline_photo"] is not None]
+    summary = dict(requested=len(pairs), valid=len(passed), failed=len(pairs)-len(passed),
+                   fallback=sum(r["scale"] == 0 for r in passed),
+                   mean_fixed_overlap_photo_change=float(np.mean(changes)) if changes else None)
+    (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary), flush=True)
+    if not passed:
+        raise SystemExit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("train", "test"):
+        p = commands.add_parser(name)
+        for flag in ("rop", "pixel", "data", "out"):
+            p.add_argument(f"--{flag}", type=Path, required=True)
+        p.add_argument("--list", type=Path)
+        p.add_argument("--gpu", type=int, choices=(0, 1), default=1)
+        for key in MODEL_KEYS[:-1]:
+            p.add_argument("--"+key.replace("_", "-"), type=type(DEFAULTS[key]))
+        p.add_argument("--plane-mode", choices=("learned", "fixed-half"))
+        p.add_argument("--min-retention", type=float, default=0.995)
+        if name == "train":
+            p.add_argument("--init", choices=("scratch", "pretrained"), default="scratch")
+            p.add_argument("--schedule", type=schedule)
+            p.add_argument("--seed", type=int, default=2026)
+            p.add_argument("--lr-multiplier", type=float, default=1.0)
+            for key in ("alignment", "coefficient", "pixel_weights", "resume", "val_data", "val_list"):
+                p.add_argument("--"+key.replace("_", "-"), type=Path)
+        else:
+            p.add_argument("--checkpoint", type=Path, required=True)
+            p.add_argument("--no-guard", action="store_true")
+            p.add_argument("--metrics-only", action="store_true")
+    args = parser.parse_args()
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    if args.out.exists():
+        parser.error("--out must be a new directory")
+    if args.command == "train":
+        if args.val_list and not args.val_data:
+            parser.error("--val-list requires --val-data")
+        if not math.isfinite(args.lr_multiplier) or args.lr_multiplier <= 0:
+            parser.error("Invalid learning-rate multiplier")
+        previous = read_checkpoint(args.resume) if args.resume else None
+        args.alignment = args.alignment or args.rop / "woCoefNet/model_homo/epoch100_model.pth"
+        args.coefficient = args.coefficient or args.rop / "wCoefNet/model_coef/epoch050_coefmodel.pth"
+        args.pixel_weights = args.pixel_weights or args.pixel / "checkpoints/ckpt.pth"
+    else:
+        previous = read_checkpoint(args.checkpoint)
+    for key in MODEL_KEYS:
+        if getattr(args, key) is None:
+            setattr(args, key, previous["config"]["model"][key] if previous else DEFAULTS[key])
+    if previous and args.plane_mode != previous["config"]["model"]["plane_mode"]:
+        parser.error("The plane mode must match the checkpoint")
+    if args.command == "train":
+        if args.schedule is None:
+            args.schedule = schedule("geometry:100,residual:50" if args.plane_mode == "fixed-half"
+                                     else "geometry:10,plane:5,residual:5,joint:5")
+        if args.plane_mode == "fixed-half" and "plane" in args.schedule:
+            parser.error("Fixed-half mode has no learnable plane phase")
+    if not (64 <= args.max_edge <= 1200 and 0 < args.max_shift <= 64 and 1 <= args.iters <= 12
+            and 0 < args.homo_bound <= 224 and 0 < args.tps_bound <= 160
+            and 0 < args.min_retention <= 1):
+        parser.error("Invalid model bounds or retention")
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA unavailable on requested GPU{args.gpu}")
+    torch.manual_seed(getattr(args, "seed", 2026))
+    torch.backends.cudnn.benchmark = False
+    torch.set_num_threads(1)
+    cv2.setNumThreads(1)
+    if args.command == "train":
+        train(args, previous)
+    else:
+        test(args, previous)
+
+
+if __name__ == "__main__":
+    main()
