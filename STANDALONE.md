@@ -28,6 +28,16 @@ python ResearchRuntime/launch.py --gpu 1 --name paper_adapter_v1 --program stitc
   --out runs/paper_adapter_v1 --gpu 1
 ```
 
+双卡训练使用 DDP，GPU0 和 GPU1 分别读取不同图像对并同步梯度：
+
+```bash
+python ResearchRuntime/launch.py --gpus 0,1 --name paper_adapter_ddp_v1 \
+  --program stitch.py -- train --data /path/to/training \
+  --base-checkpoint checkpoints/fixed_half_pixel_epoch150.pt \
+  --schedule geometry:10,residual:10,fusion:20 \
+  --out runs/paper_adapter_ddp_v1
+```
+
 普通测试输出学习缝合后的 `blend.png`、`seam_probability.png`、两张变形图、有效掩码和光度指标。此前得到 mPSNR 25.128 dB、mSSIM 0.7930 的基线检查点仍保留在 `checkpoints/fixed_half_pixel_epoch150.pt`。论文模块是否提升指标必须在同一 1,105 对上实测，代码不预设“必然提升”。使用同一比较入口：
 
 ```bash

@@ -96,6 +96,11 @@ class FullModel(nn.Module):
         fused = (images * weights).sum(0, keepdim=True)
         return fused, None, weights
 
+    def forward(self, images, phase, synthetic_target=None):
+        # DDP requires training work to pass through Module.forward so its
+        # reducer can synchronize gradients between pair-level workers.
+        return training_objective(self, images, phase, synthetic_target)
+
     def build(self, images, phase):
         train_geometry = phase in ("geometry", "plane", "joint")
         with nullcontext() if train_geometry else torch.no_grad():

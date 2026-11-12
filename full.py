@@ -10,6 +10,8 @@ import random
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from full_model import FullModel, PHASES, synthetic_pair, training_objective
 from model import InvalidPair
@@ -25,6 +27,18 @@ DEFAULTS = dict(max_edge=512, max_shift=16.0, iters=4, homo_bound=160.0, tps_bou
                 plane_mode="learned", alignment_adapter="msda", fusion_mode="seam",
                 fusion_width=24)
 PHASE_LR = dict(geometry=1e-4, plane=1e-4, residual=1e-5, fusion=1e-4, joint=3e-6)
+
+
+def distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def primary():
+    return not distributed() or dist.get_rank() == 0
+
+
+def unwrap(model):
+    return model.module if isinstance(model, DistributedDataParallel) else model
 
 
 def schedule(value):
@@ -66,12 +80,13 @@ def read_checkpoint(path):
 
 
 def phase_optimizer(model, phase, multiplier):
-    model.set_phase(phase)
+    unwrap(model).set_phase(phase)
     parameters = [p for p in model.parameters() if p.requires_grad]
     return torch.optim.AdamW(parameters, lr=PHASE_LR[phase]*multiplier, weight_decay=1e-4), parameters
 
 
 def gradient_groups(model):
+    model = unwrap(model)
     result = {}
     for name in ("geometry", "alignment_adapter", "coef", "flow", "fusion"):
         module = getattr(model, name)
@@ -82,7 +97,11 @@ def gradient_groups(model):
 
 
 def train(args, previous, base_state=None):
+    rank = dist.get_rank() if distributed() else 0
+    world = dist.get_world_size() if distributed() else 1
     pairs = discover(args.data, args.list)
+    if len(pairs) < world:
+        raise ValueError(f"Distributed training needs at least {world} image pairs")
     validation = discover(args.val_data, args.val_list) if args.val_data else []
     if validation:
         disjoint_train_val(pairs, validation)
@@ -116,6 +135,10 @@ def train(args, previous, base_state=None):
         if incompatible.unexpected_keys or any(
                 not key.startswith(allowed) for key in incompatible.missing_keys):
             raise ValueError(f"Incompatible base checkpoint: {incompatible}")
+    if distributed():
+        local_rank = int(os.environ["LOCAL_RANK"])
+        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
+                                        broadcast_buffers=False, find_unused_parameters=True)
     init_keys = ("alignment", "pixel_weights") if args.plane_mode == "fixed-half" else (
         "alignment", "coefficient", "pixel_weights"
     )
@@ -123,9 +146,13 @@ def train(args, previous, base_state=None):
         {k: file_hash(getattr(args, k)) for k in init_keys}
         if init == "pretrained" else {}
     )
-    args.out.mkdir(parents=True)
-    log_line(args.out / "plan.jsonl", dict(config=configuration, schedule=args.schedule,
-             init=init, init_hashes=init_hashes, train_pairs=len(pairs), validation_pairs=len(validation)))
+    if primary():
+        args.out.mkdir(parents=True)
+        log_line(args.out / "plan.jsonl", dict(config=configuration, schedule=args.schedule,
+                 init=init, init_hashes=init_hashes, train_pairs=len(pairs),
+                 validation_pairs=len(validation), world_size=world))
+    if distributed():
+        dist.barrier()
     old_phase = None
     for offset in range(start, len(args.schedule)):
         epoch, phase = offset + 1, args.schedule[offset]
@@ -137,17 +164,37 @@ def train(args, previous, base_state=None):
             old_phase = phase
         order = list(pairs)
         random.Random(args.seed + epoch).shuffle(order)
+        local_order = order[rank::world]
+        steps = math.ceil(len(order) / world)
+        while len(local_order) < steps:
+            local_order.append(order[(rank + len(local_order) * world) % len(order)])
         values = []
-        for index, pair in enumerate(order, 1):
+        local_skipped = 0
+        step_log = args.out / ("steps.jsonl" if world == 1 else f"steps_rank{rank}.jsonl")
+        skip_log = args.out / ("skipped.jsonl" if world == 1 else f"skipped_rank{rank}.jsonl")
+        for index, pair in enumerate(local_order, 1):
             optimizer.zero_grad(set_to_none=True)
             target = None
+            failure = None
             try:
                 images = load_pair(pair)
-                if phase == "geometry" and init == "scratch" and (index + epoch) % 2 == 0:
-                    images, target = synthetic_pair(images, args.seed + epoch*100_003 + index)
-                loss, terms = training_objective(model, images, phase, target)
+                if phase == "geometry" and init == "scratch" and (index + epoch + rank) % 2 == 0:
+                    synthetic_seed = args.seed + epoch*100_003 + rank*1_000_003 + index
+                    images, target = synthetic_pair(images, synthetic_seed)
+                loss, terms = model(images, phase, target)
             except (InvalidPair, torch.linalg.LinAlgError) as exc:
-                log_line(args.out / "skipped.jsonl", dict(epoch=epoch, phase=phase, id=pair[0], reason=str(exc)))
+                failure = str(exc)
+            if distributed():
+                usable = torch.tensor([failure is None], device="cuda", dtype=torch.int32)
+                dist.all_reduce(usable, op=dist.ReduceOp.MIN)
+                if not bool(usable.item()):
+                    log_line(skip_log, dict(epoch=epoch, phase=phase, id=pair[0],
+                                            reason=failure or "peer rank had an invalid pair"))
+                    local_skipped += 1
+                    continue
+            elif failure is not None:
+                log_line(skip_log, dict(epoch=epoch, phase=phase, id=pair[0], reason=failure))
+                local_skipped += 1
                 continue
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss during {phase}: {pair[0]}")
@@ -161,20 +208,27 @@ def train(args, previous, base_state=None):
                 result["gradient_groups"] = groups
             result.update({key: float(value.detach()) for key, value in terms.items()})
             values.append(result["loss"])
-            log_line(args.out / "steps.jsonl", result)
-            if index == 1 or index % 25 == 0 or index == len(order):
-                print(f"{phase} epoch={epoch} pair={index}/{len(order)} loss={result['loss']:.6f} "
+            log_line(step_log, result)
+            if primary() and (index == 1 or index % 25 == 0 or index == len(local_order)):
+                print(f"{phase} epoch={epoch} local_pair={index}/{len(local_order)} "
+                      f"world={world} loss={result['loss']:.6f} "
                       f"grad={float(norm):.6f} groups={groups}", flush=True)
-        if not values:
+        totals = torch.tensor([sum(values), len(values), local_skipped], device="cuda",
+                              dtype=torch.float64)
+        if distributed():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_loss, used, skipped = totals.tolist()
+        if not used:
             raise ValueError(f"No valid training pairs in epoch {epoch} ({phase})")
 
         val_values = []
-        if validation and phase in ("residual", "fusion", "joint"):
+        if primary() and validation and phase in ("residual", "fusion", "joint"):
+            evaluation_model = unwrap(model)
             for pair in validation:
                 try:
                     _, _, row = inference_metrics(
-                        pair, lambda images: model.build(images, "test")[0],
-                        model.flow, args.min_retention, False,
+                        pair, lambda images: evaluation_model.build(images, "test")[0],
+                        evaluation_model.flow, args.min_retention, False,
                     )
                     if row["refined_photo"] is not None:
                         val_values.append(row["refined_photo"])
@@ -183,21 +237,25 @@ def train(args, previous, base_state=None):
                 log_line(args.out / "validation.jsonl", dict(epoch=epoch, **row))
             if not val_values:
                 raise ValueError("No usable validation pairs")
-        score = float(np.mean(val_values)) if val_values else None
-        improved = score is not None and (best is None or score < best)
-        if improved:
-            best = score
-        state = dict(format=FORMAT, model=model.state_dict(), config=configuration, epoch=epoch,
-                     phase=phase, schedule=args.schedule, best=best, init=init, init_hashes=init_hashes,
-                     optimizer=optimizer.state_dict(), torch_rng=torch.get_rng_state(),
-                     cuda_rng=torch.cuda.get_rng_state())
-        save(args.out / "last.pt", state)
-        if improved:
-            save(args.out / "best.pt", state)
-        row = dict(epoch=epoch, phase=phase, used=len(values), skipped=len(order)-len(values),
-                   train_loss=float(np.mean(values)), validation_photo=score)
-        log_line(args.out / "epochs.jsonl", row)
-        print(json.dumps(row), flush=True)
+        if primary():
+            score = float(np.mean(val_values)) if val_values else None
+            improved = score is not None and (best is None or score < best)
+            if improved:
+                best = score
+            state = dict(format=FORMAT, model=unwrap(model).state_dict(), config=configuration,
+                         epoch=epoch, phase=phase, schedule=args.schedule, best=best, init=init,
+                         init_hashes=init_hashes, optimizer=optimizer.state_dict(),
+                         torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state())
+            save(args.out / "last.pt", state)
+            if improved:
+                save(args.out / "best.pt", state)
+            row = dict(epoch=epoch, phase=phase, used=int(used), skipped=int(skipped),
+                       train_loss=float(total_loss / used), validation_photo=score,
+                       world_size=world)
+            log_line(args.out / "epochs.jsonl", row)
+            print(json.dumps(row), flush=True)
+        if distributed():
+            dist.barrier()
 
 
 @torch.no_grad()
@@ -273,8 +331,16 @@ def main():
             p.add_argument("--no-guard", action="store_true")
             p.add_argument("--metrics-only", action="store_true")
     args = parser.parse_args()
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        if args.command != "train":
+            parser.error("Multi-GPU mode is supported for training only")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    else:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     if args.out.exists():
         parser.error("--out must be a new directory")
     if args.command == "train":
@@ -320,10 +386,14 @@ def main():
     torch.backends.cudnn.benchmark = False
     torch.set_num_threads(1)
     cv2.setNumThreads(1)
-    if args.command == "train":
-        train(args, previous, base_state)
-    else:
-        test(args, previous)
+    try:
+        if args.command == "train":
+            train(args, previous, base_state)
+        else:
+            test(args, previous)
+    finally:
+        if distributed():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,17 @@ python ResearchRuntime/launch.py --gpu 1 --name paper_adapter_v1 --program stitc
   --out runs/paper_adapter_v1 --gpu 1
 ```
 
+两张卡空闲时可用 DDP。每张卡各处理一对图并同步梯度，不能使用会把两张视图拆开的普通 `DataParallel`：
+
+```bash
+python ResearchRuntime/launch.py --gpus 0,1 --name paper_adapter_ddp_v1 \
+  --program stitch.py -- train \
+  --data /path/to/training \
+  --base-checkpoint checkpoints/fixed_half_pixel_epoch150.pt \
+  --schedule geometry:10,residual:10,fusion:20 \
+  --out runs/paper_adapter_ddp_v1
+```
+
 ## 测试和统一对照
 
 ```bash
