@@ -96,10 +96,10 @@ class FullModel(nn.Module):
         fused = (images * weights).sum(0, keepdim=True)
         return fused, None, weights
 
-    def forward(self, images, phase, synthetic_target=None):
+    def forward(self, images, phase, synthetic_target=None, depths=None, depth_weight=0.0):
         # DDP requires training work to pass through Module.forward so its
         # reducer can synchronize gradients between pair-level workers.
-        return training_objective(self, images, phase, synthetic_target)
+        return training_objective(self, images, phase, synthetic_target, depths, depth_weight)
 
     def build(self, images, phase):
         train_geometry = phase in ("geometry", "plane", "joint")
@@ -178,13 +178,21 @@ def synthetic_pair(images, seed):
     return torch.cat((images[:1], second)), base.new_tensor([-dx, -dy]).view(1, 1, 2)
 
 
-def training_objective(model, images, phase, synthetic_target):
+def training_objective(model, images, phase, synthetic_target, depths=None, depth_weight=0.0):
     canvas, meshes, plane_mesh, h, motion = model.build(images, phase)
     fixed = fixed_overlap(canvas)
     if int(fixed.sum()) < 64:
         raise InvalidPair("Fewer than 64 fixed overlap pixels")
     if phase == "residual":
-        return frequency_flow_objective(canvas, *model.flow(canvas), objective, FLOW_WEIGHTS)
+        residual, cycle, base = model.flow(canvas)
+        total, terms = frequency_flow_objective(canvas, residual, cycle, base, objective, FLOW_WEIGHTS)
+        if depths is not None and depth_weight > 0:
+            from depth_supervision import depth_loss
+            from model import residual_canvas
+            output = residual_canvas(canvas, base, residual)
+            terms["depth_composed"] = depth_loss(depths, output.grid, output.support)
+            total = total + depth_weight * terms["depth_composed"]
+        return total, terms
     if phase == "fusion":
         if model.fusion is None:
             raise ValueError("The fusion phase requires --fusion-mode seam")
@@ -201,6 +209,10 @@ def training_objective(model, images, phase, synthetic_target):
     terms["freq_low"], terms["freq_high"] = frequency_photo(canvas.images, fixed)
     total = total + FLOW_WEIGHTS["freq_low"] * terms["freq_low"] \
         + FLOW_WEIGHTS["freq_high"] * terms["freq_high"]
+    if depths is not None and depth_weight > 0:
+        from depth_supervision import depth_loss
+        terms["depth_tps"] = depth_loss(depths, canvas.grid, canvas.support)
+        total = total + depth_weight * terms["depth_tps"]
     if phase in ("geometry", "joint"):
         terms["global_photo"] = global_photo(images, h)
         total = total + 0.5 * terms["global_photo"]
@@ -215,6 +227,11 @@ def training_objective(model, images, phase, synthetic_target):
         )
         terms.update({f"flow_{k}": v for k, v in flow_terms.items()})
         total = total + flow_loss
+        if depths is not None and depth_weight > 0:
+            from model import residual_canvas
+            output = residual_canvas(canvas, base, residual)
+            terms["depth_composed"] = depth_loss(depths, output.grid, output.support)
+            total = total + depth_weight * terms["depth_composed"]
         if model.fusion is not None:
             refined, support = refine(canvas, base, residual)
             fused, probability, _ = model.fuse(refined, support)

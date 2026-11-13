@@ -111,6 +111,11 @@ def train(args, previous, base_state=None):
     configuration = dict(model=model_cfg, seed=args.seed, lr_multiplier=args.lr_multiplier,
                          train=pair_fingerprint(pairs), val=pair_fingerprint(validation),
                          base_checkpoint_sha256=base_hash)
+    if args.depth_data is not None:
+        from depth_supervision import fingerprint
+        configuration["depth"] = dict(weight=args.depth_weight,
+                                      sha256=fingerprint(args.depth_data, pairs),
+                                      normalization="independent_overlap_zscore_robust_v1")
     start, best = 0, None
     if previous:
         if configuration != previous["config"]:
@@ -181,7 +186,11 @@ def train(args, previous, base_state=None):
                 if phase == "geometry" and init == "scratch" and (index + epoch + rank) % 2 == 0:
                     synthetic_seed = args.seed + epoch*100_003 + rank*1_000_003 + index
                     images, target = synthetic_pair(images, synthetic_seed)
-                loss, terms = model(images, phase, target)
+                depths = None
+                if args.depth_data is not None and target is None and phase != "fusion":
+                    from depth_supervision import load_depth
+                    depths = load_depth(args.depth_data, pair, images)
+                loss, terms = model(images, phase, target, depths, args.depth_weight)
             except (InvalidPair, torch.linalg.LinAlgError) as exc:
                 failure = str(exc)
             if distributed():
@@ -321,6 +330,8 @@ def main():
         if name == "train":
             p.add_argument("--init", choices=("scratch", "pretrained"), default="scratch")
             p.add_argument("--schedule", type=schedule)
+            p.add_argument("--depth-data", type=Path)
+            p.add_argument("--depth-weight", type=float, default=0.03)
             p.add_argument("--seed", type=int, default=2026)
             p.add_argument("--lr-multiplier", type=float, default=1.0)
             for key in ("alignment", "coefficient", "pixel_weights", "resume", "base_checkpoint",
@@ -344,6 +355,10 @@ def main():
     if args.out.exists():
         parser.error("--out must be a new directory")
     if args.command == "train":
+        if not math.isfinite(args.depth_weight) or args.depth_weight < 0:
+            parser.error("--depth-weight must be finite and nonnegative")
+        if args.depth_data is None and args.depth_weight != 0.03:
+            parser.error("--depth-weight requires --depth-data")
         if args.val_list and not args.val_data:
             parser.error("--val-list requires --val-data")
         if not math.isfinite(args.lr_multiplier) or args.lr_multiplier <= 0:
