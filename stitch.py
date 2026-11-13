@@ -9,9 +9,16 @@ import sys
 def main():
     root = Path(__file__).resolve().parent
     codes = root / "codes"
-    if len(sys.argv) < 2 or sys.argv[1] not in ("train", "test", "compare"):
-        raise SystemExit("Usage: python stitch.py {train,test,compare} --help")
+    if len(sys.argv) < 2 or sys.argv[1] not in ("train", "test", "compare", "patch-compare"):
+        raise SystemExit("Usage: python stitch.py {train,test,compare,patch-compare} --help")
     command, *options = sys.argv[1:]
+    patch_test = command == "test" and "--local-patch" in options
+    if patch_test:
+        options.remove("--local-patch")
+        if "--metrics-only" in options:
+            options.remove("--metrics-only")
+        elif "--save-stitched" not in options:
+            options.append("--save-stitched")
     if any(arg.split("=", 1)[0] in {"--rop", "--pixel", "--plane-mode"} for arg in options):
         raise SystemExit("This entry point uses the bundled sources and fixed-half plane.")
     options += ["--rop", str(root / "vendor/ropstitch"),
@@ -19,6 +26,8 @@ def main():
     if command == "compare":
         os.environ.setdefault("TORCH_HOME", str(root / "vendor/ropstitch/torch_cache"))
         entry = codes / "compare_full_test.py"
+    elif command == "patch-compare" or patch_test:
+        entry = codes / "local_patch_align.py"
     else:
         entry = codes / "full.py"
         options = [command, "--plane-mode", "fixed-half", *options]
