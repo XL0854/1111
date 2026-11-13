@@ -17,8 +17,8 @@ from skimage.metrics import structural_similarity
 
 from full import MODEL_KEYS, read_checkpoint
 from full_model import FullModel
-from model import (Canvas, InvalidPair, grid_with_offset, guarded_render, mesh_canvas,
-                   pixel_grid, warp)
+from model import (Canvas, InvalidPair, grid_with_offset, guarded_alignment, mesh_canvas,
+                   pixel_grid)
 from run import discover, file_hash, image_file, load_pair, log_line
 
 
@@ -91,12 +91,9 @@ class Original:
 def refined(images, model):
     canvas = model.build(images, "test")[0]
     residual, _, base = model.flow(canvas)
-    result, support, scale = guarded_render(canvas, base, residual, 0.995)
-    grid = canvas.grid if scale == 0 else warp(
-        canvas.grid.permute(0, 3, 1, 2), grid_with_offset(base, residual * scale),
-        padding="border",
-    ).permute(0, 2, 3, 1)
-    return result, support, grid, dict(residual_scale=scale, fallback=scale == 0)
+    result, scale, strategy = guarded_alignment(canvas, base, residual, 0.995)
+    return result.images, result.support, result.grid, dict(
+        residual_scale=scale, residual_strategy=strategy, fallback=scale == 0)
 
 
 def geometry_metrics(grid, valid, source_size):

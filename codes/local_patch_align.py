@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -218,7 +219,8 @@ def compare(args):
                    "min_area_ratio", "max_area_ratio", "max_log_condition_increase")
     columns = ("id", "psnr_tier", "ssim_tier", *(
         f"{arm}_{metric}" for arm in ("baseline", "repair") for metric in
-        (*METRICS, "overlap_pixels", "source_coverage", "nonoverlap_shape_tail10")),
+        (*METRICS, "overlap_pixels", "source_coverage", "nonoverlap_shape_tail10",
+         "residual_scale", "residual_strategy")),
         *diagnostics, "error")
     rows = []
     with (args.out / "metrics.csv").open("w", newline="") as handle:
@@ -258,6 +260,8 @@ def compare(args):
                    repaired_pairs=sum(row.get("accepted_patches", 0) > 0 for row in rows),
                    overlap_changed=sum(row.get("baseline_overlap_pixels") != row.get("repair_overlap_pixels")
                                        for row in rows if "error" not in row),
+                   residual_strategies=dict(Counter(row["baseline_residual_strategy"] for row in rows
+                                                    if "error" not in row)),
                    metrics=summarize(rows, tiers))
     report = json.dumps(summary, indent=2, allow_nan=False)
     (args.out / "summary.json").write_text(report + "\n")

@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from model import (InvalidPair, PixelResidual, RopTPS, fixed_overlap,
-                   guarded_render, objective, photo)
+                   guarded_alignment, objective, photo)
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -104,13 +104,14 @@ def log_line(path, item):
 def inference_metrics(pair, geom, model, retention, guard):
     canvas = geom(load_pair(pair))
     residual, _, base = model(canvas)
-    images, support, scale = guarded_render(canvas, base, residual, retention, guard)
+    result, scale, strategy = guarded_alignment(canvas, base, residual, retention, guard)
+    images, support = result.images, result.support
     mask = fixed_overlap(canvas)
     visible = support > 0.99
     prior = canvas.support > 0.99
     valid = int(mask.sum())
     metrics = dict(
-        id=pair[0], scale=scale, fixed_overlap_pixels=valid,
+        id=pair[0], scale=scale, residual_strategy=strategy, fixed_overlap_pixels=valid,
         baseline_photo=float(photo(canvas.images, mask)) if valid else None,
         refined_photo=float(photo(images, mask)) if valid else None,
         view_retention=((visible & prior).sum((1, 2, 3)) /

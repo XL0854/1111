@@ -173,13 +173,18 @@ class PixelResidual(nn.Module):
         return residual, cycle, base
 
 
-def refine(canvas, base, residual):
+def residual_canvas(canvas, base, residual):
     # Compose canvas-to-TPS and TPS-to-source maps before sampling colors.
-    grid = grid_with_offset(base, residual)
-    composed = warp(canvas.grid.permute(0, 3, 1, 2), grid, padding="border")
-    images, support = render(canvas.originals, composed.permute(0, 2, 3, 1))
-    valid_canvas = warp(torch.ones_like(canvas.support), grid)
-    return images, support * valid_canvas
+    query = grid_with_offset(base, residual)
+    grid = warp(canvas.grid.permute(0, 3, 1, 2), query, padding="border").permute(0, 2, 3, 1)
+    images, support = render(canvas.originals, grid)
+    support = support * warp(torch.ones_like(canvas.support), query)
+    return Canvas(canvas.originals, grid, images, support)
+
+
+def refine(canvas, base, residual):
+    result = residual_canvas(canvas, base, residual)
+    return result.images, result.support
 
 
 def fixed_overlap(canvas):
@@ -223,25 +228,88 @@ def objective(canvas, residual, cycle, base, weights):
     return total, losses
 
 
+def grid_cells(valid):
+    return valid[:, :-1, :-1] & valid[:, 1:, :-1] & valid[:, :-1, 1:] & valid[:, 1:, 1:]
+
+
+def grid_determinants(grid):
+    # Check both triangles of each source sampling cell.
+    horizontal = grid[:, :, 1:] - grid[:, :, :-1]
+    vertical = grid[:, 1:] - grid[:, :-1]
+    top, bottom = horizontal[:, :-1], horizontal[:, 1:]
+    left, right = vertical[:, :, :-1], vertical[:, :, 1:]
+    first = top[..., 0] * left[..., 1] - top[..., 1] * left[..., 0]
+    second = bottom[..., 0] * right[..., 1] - bottom[..., 1] * right[..., 0]
+    return torch.minimum(first, second)
+
+
+def residual_problems(residual, result, tps_det, tps_cells):
+    _, det = field_terms(residual)
+    current_det = grid_determinants(result.grid)
+    visible_cells = grid_cells(result.support[:, 0] > 0.99)
+    # Reject new flips and cells compressed below 5% of their TPS area.
+    min_det = torch.where(tps_cells, tps_det.clamp_min(0) * 0.05, 0.0)
+    new_or_positive = ~tps_cells | (tps_det > 0)
+    composed = visible_cells & new_or_positive & (current_det <= min_det)
+    return (det <= 0.05) | composed
+
+
+def local_residual(residual, bad_cells, core, feather):
+    # Expand each flagged cell to its four vertices and feather the suppression.
+    vertices = F.max_pool2d(F.pad(bad_cells[:, None].float(), (1, 1, 1, 1)), 2, stride=1)
+    radius = core + feather
+    region = F.max_pool2d(vertices, (1, 2 * radius + 1), stride=1, padding=(0, radius))
+    region = F.max_pool2d(region, (2 * radius + 1, 1), stride=1, padding=(radius, 0))
+    # Replicate at the image boundary so a bad border vertex can still go to zero.
+    blurred = F.avg_pool2d(F.pad(region, (feather, feather, 0, 0), mode="replicate"),
+                           (1, 2 * feather + 1), stride=1)
+    blurred = F.avg_pool2d(F.pad(blurred, (0, 0, feather, feather), mode="replicate"),
+                           (2 * feather + 1, 1), stride=1)
+    return residual * (1 - blurred).permute(0, 2, 3, 1)
+
+
 @torch.no_grad()
-def guarded_render(canvas, base, residual, min_retention, guard=True):
+def guarded_alignment(canvas, base, residual, min_retention, guard=True):
+    """Return the actual rendered canvas, global scale and residual strategy."""
     mask = fixed_overlap(canvas)
+    if int(mask.sum()) < 64 or not torch.isfinite(residual).all():
+        return canvas, 0.0, "tps"
+    full = residual_canvas(canvas, base, residual)
+    if not guard:
+        return full, 1.0, "unguarded"
+
     original_error = photo(canvas.images, mask)
-    baseline = (canvas.support > 0.99)
-    if int(mask.sum()) < 64:
-        return canvas.images, canvas.support, 0.0
-    for scale in ((1.0, 0.5, 0.25) if guard else (1.0,)):
-        current = residual * scale
-        if not torch.isfinite(current).all():
-            continue
-        images, support = refine(canvas, base, current)
-        if not guard:
-            return images, support, scale
-        visible = support > 0.99
+    baseline = canvas.support > 0.99
+    tps_det = grid_determinants(canvas.grid)
+    tps_cells = grid_cells(baseline[:, 0])
+
+    def preserves_alignment(candidate):
+        visible = candidate.support > 0.99
         retained = (visible & baseline).sum((1, 2, 3)) / baseline.sum((1, 2, 3)).clamp_min(1)
         overlap_retained = masked_mean(visible.all(0, keepdim=True).float(), mask)
-        _, determinant = field_terms(current)
-        if (retained.min() >= min_retention and overlap_retained >= min_retention
-                and determinant.min() > 0.05 and photo(images, mask) <= original_error + 0.001):
-            return images, support, scale
-    return canvas.images, canvas.support, 0.0
+        return bool((retained.min() >= min_retention) & (overlap_retained >= min_retention)
+                    & (photo(candidate.images, mask) <= original_error + 0.001))
+
+    bad = residual_problems(residual, full, tps_det, tps_cells)
+    if not bad.any() and preserves_alignment(full):
+        return full, 1.0, "full"
+    if bad.any():
+        for core, feather in ((1, 5), (3, 9), (7, 15)):
+            repaired = local_residual(residual, bad, core, feather)
+            candidate = residual_canvas(canvas, base, repaired)
+            remaining = residual_problems(repaired, candidate, tps_det, tps_cells)
+            if not remaining.any() and preserves_alignment(candidate):
+                return candidate, 1.0, "local"
+            bad |= remaining
+    for scale in (0.5, 0.25):
+        scaled = residual * scale
+        candidate = residual_canvas(canvas, base, scaled)
+        if (not residual_problems(scaled, candidate, tps_det, tps_cells).any()
+                and preserves_alignment(candidate)):
+            return candidate, scale, "global"
+    return canvas, 0.0, "tps"
+
+
+def guarded_render(canvas, base, residual, min_retention, guard=True):
+    result, scale, _ = guarded_alignment(canvas, base, residual, min_retention, guard)
+    return result.images, result.support, scale
