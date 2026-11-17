@@ -5,6 +5,12 @@ import os
 import runpy
 import sys
 
+from project_config import DEPTH_DATA, TEST_DATA, TRAIN_DATA, require_directory
+
+
+def has_option(options, name):
+    return any(option.split("=", 1)[0] == name for option in options)
+
 
 def main():
     root = Path(__file__).resolve().parent
@@ -12,6 +18,13 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("train", "test", "compare", "patch-compare"):
         raise SystemExit("Usage: python stitch.py {train,test,compare,patch-compare} --help")
     command, *options = sys.argv[1:]
+    if not has_option(options, "--data"):
+        data = TRAIN_DATA if command == "train" else TEST_DATA
+        options += ["--data", str(require_directory(data, f"{command} data"))]
+    if command == "train" and not has_option(options, "--depth-data"):
+        options += ["--depth-data", str(require_directory(DEPTH_DATA, "depth cache"))]
+        if not has_option(options, "--depth-weight"):
+            options += ["--depth-weight", "0.03"]
     patch_test = command == "test" and "--local-patch" in options
     if patch_test:
         options.remove("--local-patch")

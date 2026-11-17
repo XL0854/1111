@@ -192,8 +192,8 @@ def main(args):
     for key in MODEL_KEYS:
         setattr(args, key, state["config"]["model"][key])
     pairs = discover(args.data)
-    if len(pairs) != 1105:
-        raise ValueError(f"Expected 1105 matched test pairs, found {len(pairs)}")
+    if len(pairs) != 1106:
+        raise ValueError(f"Expected 1106 official UDIS-D test pairs, found {len(pairs)}")
     if args.limit:
         pairs = pairs[:args.limit]
     alignment = args.rop / "woCoefNet/model_homo/epoch100_model.pth"
